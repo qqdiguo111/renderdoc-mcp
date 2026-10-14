@@ -145,20 +145,31 @@ json McpServer::handleInitialize(const json& msg)
 {
     json id = msg.value("id", json(nullptr));
 
-    // Validate client protocol version for compatibility
-    static constexpr const char* kSupportedProtocolVersion = "2025-03-26";
+    // MCP 规范的 initialize 协商语义：client 声明已知协议版本 → 回显该版本
+    // （协商成功）；未知/未来版本 → 返回本 server 支持的版本供 client 退避。
+    // （历史行为是对任何不等版本直接 error——opencode 的 legacy client 声明
+    // 2025-11-25 被 4xx 拒绝，连接失败；基础 tools 协议自 2025-03-26 起向后
+    // 兼容，回显已知版本无消息格式风险。）
+    static constexpr const char* kServerProtocolVersion = "2025-03-26";
+    auto isKnownProtocolVersion = [](const std::string& v) {
+        return v == "2024-11-05" || v == "2025-03-26" ||
+               v == "2025-06-18" || v == "2025-11-25";
+    };
+    std::string negotiated = kServerProtocolVersion;
     json params = msg.value("params", json::object());
     if (params.contains("protocolVersion")) {
         std::string clientVersion = params["protocolVersion"].get<std::string>();
-        if (clientVersion != kSupportedProtocolVersion) {
+        if (clientVersion == kServerProtocolVersion || isKnownProtocolVersion(clientVersion)) {
+            negotiated = clientVersion;
+        } else {
             return makeError(id, -32602,
                 "Unsupported protocol version: " + clientVersion +
-                " (server supports " + kSupportedProtocolVersion + ")");
+                " (server supports " + std::string(kServerProtocolVersion) + ")");
         }
     }
 
     json result;
-    result["protocolVersion"] = kSupportedProtocolVersion;
+    result["protocolVersion"] = negotiated;
     result["capabilities"]["tools"] = json::object();
     result["serverInfo"]["name"] = "renderdoc-mcp";
     result["serverInfo"]["version"] = "1.0.0";

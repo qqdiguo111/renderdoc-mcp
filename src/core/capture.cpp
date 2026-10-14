@@ -26,6 +26,68 @@ namespace fs = std::filesystem;
 
 namespace {
 
+#ifdef _WIN32
+// MCP stdio transport: this process's stdout IS the JSON-RPC stream. RenderDoc's
+// ExecuteAndInject launches the target with inherited standard handles, so a
+// target that writes to stdout/stderr (most engines do) pipes its raw text
+// straight into the protocol stream and the client sees "Failed to parse JSONL".
+//
+// While the target is launched we repoint the OS-level std handles at NUL and
+// drop the inherit flag on the originals, so nothing the child can reach still
+// refers to the MCP pipe. The CRT's cached handles (what std::cout writes to)
+// are deliberately untouched, so our own responses keep flowing.
+class ChildStdioIsolation {
+public:
+    ChildStdioIsolation() {
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        sa.lpSecurityDescriptor = nullptr;
+        nul_ = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+        if (nul_ == INVALID_HANDLE_VALUE)
+            nul_ = nullptr;
+
+        for (size_t i = 0; i < kCount; ++i) {
+            saved_[i] = GetStdHandle(kIds[i]);
+            DWORD flags = 0;
+            if (saved_[i] != nullptr && saved_[i] != INVALID_HANDLE_VALUE &&
+                GetHandleInformation(saved_[i], &flags) &&
+                (flags & HANDLE_FLAG_INHERIT) != 0) {
+                if (SetHandleInformation(saved_[i], HANDLE_FLAG_INHERIT, 0))
+                    stripped_[i] = true;
+            }
+        }
+        if (nul_ != nullptr) {
+            for (size_t i = 0; i < kCount; ++i)
+                SetStdHandle(kIds[i], nul_);
+        }
+    }
+
+    ~ChildStdioIsolation() {
+        for (size_t i = 0; i < kCount; ++i) {
+            if (nul_ != nullptr)
+                SetStdHandle(kIds[i], saved_[i]);
+            if (stripped_[i])
+                SetHandleInformation(saved_[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        }
+        if (nul_ != nullptr)
+            CloseHandle(nul_);
+    }
+
+    ChildStdioIsolation(const ChildStdioIsolation&) = delete;
+    ChildStdioIsolation& operator=(const ChildStdioIsolation&) = delete;
+
+private:
+    static constexpr size_t kCount = 3;
+    static constexpr DWORD kIds[kCount] = { STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+                                            STD_ERROR_HANDLE };
+    HANDLE saved_[kCount] = { nullptr, nullptr, nullptr };
+    bool stripped_[kCount] = { false, false, false };
+    HANDLE nul_ = nullptr;
+};
+#endif
+
 std::string generateOutputPath(const std::string& exePath) {
     auto tempDir = fs::temp_directory_path() / "renderdoc-mcp";
     fs::create_directories(tempDir);
@@ -192,15 +254,22 @@ CaptureResult captureFrame(Session& session, const CaptureRequest& req) {
     implicitLayerPath.value = runtimeDir.c_str();
     envMods.push_back(implicitLayerPath);
 
-    ExecuteResult execResult = RENDERDOC_ExecuteAndInject(
-        rdcstr(req.exePath.c_str()),
-        rdcstr(workingDir.c_str()),
-        rdcstr(req.cmdLine.c_str()),
-        envMods,
-        rdcstr(captureTemplate.c_str()),
-        opts,
-        false
-    );
+    ExecuteResult execResult;
+    {
+#ifdef _WIN32
+        // Keep the target's stdio away from the MCP protocol stream.
+        ChildStdioIsolation stdioIsolation;
+#endif
+        execResult = RENDERDOC_ExecuteAndInject(
+            rdcstr(req.exePath.c_str()),
+            rdcstr(workingDir.c_str()),
+            rdcstr(req.cmdLine.c_str()),
+            envMods,
+            rdcstr(captureTemplate.c_str()),
+            opts,
+            false
+        );
+    }
 
     if (execResult.result.code != ResultCode::Succeeded)
         throw CoreError(CoreError::Code::InternalError,
